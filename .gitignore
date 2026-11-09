@@ -3,3 +3,4 @@ obj/
 *.ico
 *.log
 preview.png
+.claude/settings.local.json
