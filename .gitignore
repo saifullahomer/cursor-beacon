@@ -1,0 +1,5 @@
+obj/
+*.exe
+*.ico
+*.log
+preview.png

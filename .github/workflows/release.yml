@@ -1,0 +1,38 @@
+# Every push to main builds CursorBeacon.exe and publishes it as a new GitHub Release.
+# Installed copies check the latest release every few hours and update themselves.
+name: Build and release
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -Version "1.0.${{ github.run_number }}" -Repo "${{ github.repository }}"
+
+      - name: Self-test
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'selftest.log'
+          $p = Start-Process ./CursorBeacon.exe -ArgumentList '--selftest', "`"$log`"" -Wait -PassThru
+          Get-Content $log
+          if ($p.ExitCode -ne 0) { throw "Self-test failed" }
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v1.0.${{ github.run_number }}"
+          $notes = "Automatic build of ${{ github.sha }}.`n`n${{ github.event.head_commit.message }}"
+          gh release create $tag CursorBeacon.exe --title "Cursor Beacon $tag" --notes "$notes" --latest
