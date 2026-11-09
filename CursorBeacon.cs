@@ -122,7 +122,7 @@ namespace CursorBeacon
         public static readonly Color[] Colors = {
             Color.FromArgb(0x22, 0xD3, 0xEE), Color.FromArgb(0xA7, 0x8B, 0xFA), Color.FromArgb(0xFB, 0xBF, 0x24),
             Color.FromArgb(0xA3, 0xE6, 0x35), Color.FromArgb(0xFB, 0x71, 0x85) };
-        public static readonly string[] SensitivityNames = { "Low", "Normal", "High" };
+        public static readonly string[] SensitivityNames = { "Low (very hard shake)", "Normal (hard shake)", "High (lighter shake)" };
 
         public volatile bool Shake = true, DoubleCtrl = true;
         public bool Dim = true, AutoUpdate = true;
@@ -659,48 +659,88 @@ namespace CursorBeacon
     }
 
     // --------------------------------------------------------- Shake detection
+    // Only a deliberate, hard shake counts: several long AND fast back-and-forth strokes
+    // in a row along one axis. A slow stroke resets the count, and X and Y are counted
+    // separately so circles and diagonal moves during normal use don't add up.
     internal class ShakeDetector
     {
-        class Axis { public bool init; public int dir, extreme; }
+        class Axis
+        {
+            public bool init; public int dir, start, extreme; public long startT, extremeT;
+            public readonly List<long> revs = new List<long>();
+        }
         readonly Axis ax = new Axis(), ay = new Axis();
-        readonly List<long> reversals = new List<long>();
 
-        // Sensitivity presets: minimum travel per stroke (px @100%), reversals needed, time window (ms)
-        static readonly int[] MinSeg = { 90, 60, 40 };
-        static readonly int[] Needed = { 5, 4, 3 };
-        static readonly int[] Window = { 900, 800, 700 };
+        //                                      Low (hard)  Normal  High (light)
+        static readonly int[] MinStroke    = {  160,        110,    70  };  // px per stroke @100% scale
+        static readonly int[] MaxStrokeMs  = {  200,        220,    260 };  // a stroke slower than this resets
+        static readonly int[] Needed       = {  6,          5,      4   };  // fast reversals in a row
+        static readonly int[] WindowMs     = {  1100,       1000,   900 };  // ...within this time
+        const int Hysteresis = 20;                                          // px of jitter ignored
 
         public int Sensitivity = 1;
         public float Scale = 1f;
 
         public bool OnMove(int x, int y, long ms)
         {
-            int seg = (int)(MinSeg[Sensitivity] * Scale);
-            bool rx = Step(ax, x, seg), ry = Step(ay, y, seg);
-            if (rx || ry) reversals.Add(ms);
-            while (reversals.Count > 0 && ms - reversals[0] > Window[Sensitivity]) reversals.RemoveAt(0);
-            if (reversals.Count >= Needed[Sensitivity]) { reversals.Clear(); return true; }
+            int s = Math.Max(0, Math.Min(2, Sensitivity));
+            int seg = (int)(MinStroke[s] * Scale), hyst = (int)(Hysteresis * Scale);
+            bool hx = Step(ax, x, ms, seg, hyst, MaxStrokeMs[s], WindowMs[s], Needed[s]);
+            bool hy = Step(ay, y, ms, seg, hyst, MaxStrokeMs[s], WindowMs[s], Needed[s]);
+            if (hx || hy) { ax.revs.Clear(); ay.revs.Clear(); return true; }
             return false;
         }
 
-        static bool Step(Axis a, int v, int seg)
+        static bool Step(Axis a, int v, long t, int seg, int hyst, int maxStroke, int window, int needed)
         {
-            if (!a.init) { a.init = true; a.extreme = v; a.dir = 0; return false; }
+            if (!a.init) { a.init = true; a.dir = 0; a.start = a.extreme = v; a.startT = a.extremeT = t; return false; }
             if (a.dir == 0)
             {
-                if (Math.Abs(v - a.extreme) >= seg) { a.dir = Math.Sign(v - a.extreme); a.extreme = v; }
+                if (Math.Abs(v - a.start) >= hyst) { a.dir = Math.Sign(v - a.start); a.extreme = v; a.extremeT = t; }
+                else if (t - a.startT > maxStroke) { a.start = v; a.startT = t; }
+                return false;
             }
-            else if (a.dir > 0)
+            bool further = a.dir > 0 ? v >= a.extreme : v <= a.extreme;
+            if (further) { a.extreme = v; a.extremeT = t; return false; }
+            if (Math.Abs(a.extreme - v) < hyst) return false;
+
+            // Direction reversed: judge the stroke that just ended.
+            int len = Math.Abs(a.extreme - a.start);
+            long dur = a.extremeT - a.startT;
+            if (len >= seg && dur <= maxStroke) a.revs.Add(t); else a.revs.Clear();
+            a.start = a.extreme; a.startT = a.extremeT;
+            a.dir = -a.dir; a.extreme = v; a.extremeT = t;
+            while (a.revs.Count > 0 && t - a.revs[0] > window) a.revs.RemoveAt(0);
+            return a.revs.Count >= needed;
+        }
+
+        // Feeds synthetic movements through a fresh detector; returns null if all behave, else what failed.
+        public static string SelfCheck()
+        {
+            string fails = "";
+            // name, amplitude px, period ms, duration ms, circle?, should trigger
+            object[][] cases = {
+                new object[] { "hard shake",          150, 300, 1500, false, true  },
+                new object[] { "slow back-and-forth", 120, 1200, 6000, false, false },
+                new object[] { "small jiggle",         30, 200, 3000, false, false },
+                new object[] { "normal circling",     100, 900, 5000, true,  false },
+                new object[] { "medium wiggle",        70, 500, 4000, false, false },
+            };
+            foreach (object[] c in cases)
             {
-                if (v > a.extreme) a.extreme = v;
-                else if (a.extreme - v >= seg) { a.dir = -1; a.extreme = v; return true; }
+                ShakeDetector d = new ShakeDetector();
+                int amp = (int)c[1], period = (int)c[2], dur = (int)c[3];
+                bool circle = (bool)c[4], expect = (bool)c[5], got = false;
+                for (int t = 0; t <= dur && !got; t += 8)
+                {
+                    double ph = 2 * Math.PI * t / period;
+                    int x = 1000 + (int)(amp * Math.Sin(ph));
+                    int y = 600 + (circle ? (int)(amp * Math.Cos(ph)) : 0);
+                    got = d.OnMove(x, y, t);
+                }
+                if (got != expect) fails += c[0] + (expect ? " did not trigger; " : " triggered; ");
             }
-            else
-            {
-                if (v < a.extreme) a.extreme = v;
-                else if (v - a.extreme >= seg) { a.dir = 1; a.extreme = v; return true; }
-            }
-            return false;
+            return fails.Length == 0 ? null : fails;
         }
     }
 
@@ -1117,11 +1157,13 @@ namespace CursorBeacon
                 if (step >= 10)
                 {
                     t1.Stop();
-                    bool ok = input.Hooked && sawActive;
+                    string shakeFails = ShakeDetector.SelfCheck();
+                    bool ok = input.Hooked && sawActive && shakeFails == null;
                     try
                     {
                         File.WriteAllText(selftestLog, (ok ? "OK" : "FAIL") + " hooks=" + input.Hooked +
-                            " beaconShown=" + sawActive + " screens=" + Screen.AllScreens.Length +
+                            " beaconShown=" + sawActive + " shake=" + (shakeFails ?? "ok") +
+                            " screens=" + Screen.AllScreens.Length +
                             " version=" + BuildInfo.Version + " repo=" + BuildInfo.Repo);
                     }
                     catch { }
